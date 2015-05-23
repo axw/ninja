@@ -25,6 +25,18 @@
 
 #include "util.h"
 
+static void CreatePipe(int fds[2]) {
+  if (pipe(fds) < 0)
+    Fatal("pipe: %s", strerror(errno));
+#if !defined(USE_PPOLL)
+  // If available, we use ppoll in DoWork(); otherwise we use pselect
+  // and so must avoid overly-large FDs.
+  if (fds[0] >= static_cast<int>(FD_SETSIZE))
+    Fatal("pipe: %s", strerror(EMFILE));
+#endif  // !USE_PPOLL
+}
+
+
 Subprocess::Subprocess(bool use_console) : fd_(-1), pid_(-1), status_(-1),
                                            use_console_(use_console) {
 }
@@ -38,15 +50,8 @@ Subprocess::~Subprocess() {
 
 bool Subprocess::Start(SubprocessSet* set, const string& command) {
   int output_pipe[2];
-  if (pipe(output_pipe) < 0)
-    Fatal("pipe: %s", strerror(errno));
+  CreatePipe(output_pipe);
   fd_ = output_pipe[0];
-#if !defined(USE_PPOLL)
-  // If available, we use ppoll in DoWork(); otherwise we use pselect
-  // and so must avoid overly-large FDs.
-  if (fd_ >= static_cast<int>(FD_SETSIZE))
-    Fatal("pipe: %s", strerror(EMFILE));
-#endif  // !USE_PPOLL
   SetCloseOnExec(fd_);
 
   pid_ = fork();
@@ -155,6 +160,7 @@ int SubprocessSet::interrupted_;
 
 void SubprocessSet::SetInterruptedFlag(int signum) {
   interrupted_ = signum;
+  SignalHandled();
 }
 
 void SubprocessSet::HandlePendingInterruption() {
@@ -171,9 +177,20 @@ void SubprocessSet::HandlePendingInterruption() {
 }
 
 bool SubprocessSet::child_exited_;
+#if !defined(USE_PPOLL)
+int SubprocessSet::child_exited_pipe_[2];
+#endif
+
+void SubprocessSet::SignalHandled() {
+#if !defined(USE_PPOLL)
+  // Wake up select. See http://cr.yp.to/docs/selfpipe.html.
+  if (write(child_exited_pipe_[1], "", 1)) {}
+#endif
+}
 
 void SubprocessSet::SetChildExited(int signum) {
   child_exited_ = true;
+  SignalHandled();
 }
 
 void SubprocessSet::HandleChildExit() {
@@ -219,6 +236,11 @@ void SubprocessSet::HandleChildExit() {
 }
 
 SubprocessSet::SubprocessSet() {
+#if !defined(USE_PPOLL)
+  CreatePipe(child_exited_pipe_);
+  SetNonBlocking(child_exited_pipe_[1]);
+#endif
+
   sigset_t set;
   sigemptyset(&set);
   sigaddset(&set, SIGINT);
@@ -251,6 +273,11 @@ SubprocessSet::~SubprocessSet() {
     Fatal("sigaction: %s", strerror(errno));
   if (sigprocmask(SIG_SETMASK, &old_mask_, 0) < 0)
     Fatal("sigprocmask: %s", strerror(errno));
+
+#if !defined(USE_PPOLL)
+  close(child_exited_pipe_[0]);
+  close(child_exited_pipe_[1]);
+#endif
 }
 
 Subprocess *SubprocessSet::Add(const string& command, bool use_console) {
@@ -329,6 +356,7 @@ bool SubprocessSet::DoWork() {
     return IsInterrupted();
   }
 
+  HandleChildExit();
   HandlePendingInterruption();
   if (IsInterrupted())
     return true;
